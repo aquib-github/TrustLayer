@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+.venv/
+
+# Build outputs
+dist/
+build/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+wheels/
+
+# Environment files (keep .env.example, ignore actual .env)
+.env
+.env.local
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Logs
+*.log
+npm-debug.log*
+
+# Lock files (uv)
+# uv.lock is intentionally tracked
