@@ -38,3 +38,6 @@ npm-debug.log*
 
 # Lock files (uv)
 # uv.lock is intentionally tracked
+
+# HuggingFace model cache (BGE-M3, DeBERTa-v3 — ~3GB)
+models_cache/
