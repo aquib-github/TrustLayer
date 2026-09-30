@@ -24,18 +24,27 @@ def extract_claims_from_text_heuristic(text: str) -> list[str]:
     """
     Fallback deterministic claim extractor if the external API is unreachable or rate-limited.
     Splits text into atomic sentences/clauses containing factual statements.
+    Excludes greetings, questions, and imperative action requests (e.g. 'please transfer $25').
     """
+    # Imperative action prefixes that represent commands, not verifiable factual claims
+    action_prefixes = [
+        "hello", "hi", "hey", "how can", "is there", "would you", "could you",
+        "thank", "please note", "please transfer", "transfer ", "please send",
+        "send ", "pay ", "check ", "show ", "view ", "block ", "freeze ",
+        "lock ", "dispute ", "i want to", "i would like to", "can you",
+    ]
+
     sentences = re.split(r"(?<=[.!?])\s+", text.strip())
     claims: list[str] = []
     for s in sentences:
         s_clean = s.strip().rstrip(".!?")
         if not s_clean:
             continue
-        # Filter out generic pleasantries / questions
-        if any(s_clean.lower().startswith(w) for w in ["hello", "hi", "how can", "is there", "would you", "thank", "please note"]):
+        s_lower = s_clean.lower()
+        if any(s_lower.startswith(w) for w in action_prefixes):
             continue
         claims.append(s_clean)
-    return claims if claims else [text.strip()]
+    return claims
 
 
 def _parse_claims_response(raw_text: str) -> list[str]:
@@ -92,8 +101,11 @@ def extract_claims(
                 "parts": [
                     {
                         "text": (
-                            "Extract all individual atomic factual claims made in the following text. "
-                            "Exclude greetings, polite questions, and pleasantries. "
+                            "Extract all factual claims regarding bank policies, fees, limits, rules, procedures, "
+                            "or account terms mentioned in the following text. "
+                            "Do NOT extract user action requests, transaction commands, recipient names, or "
+                            "pleasantries (e.g. 'transfer $25 to Bob' is a command, not a policy claim). "
+                            "If the text contains no factual policy claims, return an empty list: {\"claims\": []}.\n"
                             "Output ONLY a valid JSON object in this format:\n"
                             '{"claims": ["claim 1", "claim 2"]}\n\n'
                             f'Text: "{text}"'

@@ -351,7 +351,7 @@ class GroundingResult(Base):
     )
     retrieved_doc_ids = mapped_column(ARRAY(PG_UUID(as_uuid=True)), nullable=True)
     nli_label: Mapped[str] = mapped_column(Text, nullable=True)
-    grounding_score: Mapped[float] = mapped_column(Numeric, nullable=True)
+    grounding_score: Mapped[float] = mapped_column(Numeric(5, 4), nullable=True)
 
     # relationships
     claim: Mapped["Claim"] = relationship(back_populates="grounding_results")
@@ -378,7 +378,7 @@ class PolicyCheck(Base):
     )
     rbac_result: Mapped[str] = mapped_column(Text, nullable=True)
     sequence_anomaly_flag: Mapped[bool] = mapped_column(Boolean, nullable=True)
-    policy_risk_score: Mapped[float] = mapped_column(Numeric, nullable=True)
+    policy_risk_score: Mapped[float] = mapped_column(Numeric(5, 4), nullable=True)
 
     # relationships
     action: Mapped["AgentAction"] = relationship(back_populates="policy_checks")
@@ -406,9 +406,9 @@ class Decision(Base):
     action_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("agent_actions.id"), nullable=True
     )
-    grounding_score: Mapped[float] = mapped_column(Numeric, nullable=True)
-    policy_risk_score: Mapped[float] = mapped_column(Numeric, nullable=True)
-    final_risk: Mapped[float] = mapped_column(Numeric, nullable=True)
+    grounding_score: Mapped[float] = mapped_column(Numeric(5, 4), nullable=True)
+    policy_risk_score: Mapped[float] = mapped_column(Numeric(5, 4), nullable=True)
+    final_risk: Mapped[float] = mapped_column(Numeric(5, 4), nullable=True)
     decision: Mapped[DecisionType] = mapped_column(
         SAEnum(
             DecisionType,
