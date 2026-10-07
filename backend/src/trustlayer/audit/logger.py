@@ -156,13 +156,17 @@ async def record_audit_pipeline(
         decision_id = decision_obj.id
 
     # 5. Record primary AuditLog row
+    audit_event = event or decision_data.get("event", "decision_made")
     audit_log_obj = AuditLog(
         id=uuid.uuid4(),
         request_id=request_id,
         session_id=session_id,
         action_id=action_id,
         decision_id=decision_id,
-        event=event or decision_data.get("event", "decision_made"),
+        event=audit_event,
+        event_type=audit_event,
+        actor_id=None,
+        reason=decision_data.get("reason"),
         timestamp=now,
     )
     session.add(audit_log_obj)

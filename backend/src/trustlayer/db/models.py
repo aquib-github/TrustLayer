@@ -422,6 +422,7 @@ class Decision(Base):
         PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    resolution_status: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # relationships
     action: Mapped["AgentAction"] = relationship(back_populates="decisions")
@@ -437,7 +438,10 @@ class AuditLog(Base):
       session_id  UUID REFERENCES chat_sessions(id),
       action_id   UUID REFERENCES agent_actions(id) NULL,
       decision_id UUID REFERENCES decisions(id) NULL,
-      event       TEXT,   -- e.g. 'decision_made', 'grounding_unavailable', ...
+      event       TEXT,
+      event_type  TEXT,
+      actor_id    UUID REFERENCES users(id) NULL,
+      reason      TEXT,
       timestamp   TIMESTAMP
     )
     """
@@ -459,7 +463,12 @@ class AuditLog(Base):
     decision_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("decisions.id"), nullable=True
     )
-    event: Mapped[str] = mapped_column(Text, nullable=True)
+    event: Mapped[str | None] = mapped_column(Text, nullable=True)
+    event_type: Mapped[str | None] = mapped_column(Text, nullable=True)
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     timestamp: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=True
     )
@@ -468,3 +477,5 @@ class AuditLog(Base):
     session: Mapped["ChatSession"] = relationship(back_populates="audit_entries")
     action: Mapped["AgentAction"] = relationship(back_populates="audit_entries")
     decision_rel: Mapped["Decision"] = relationship(back_populates="audit_entries")
+    actor: Mapped["User | None"] = relationship(foreign_keys=[actor_id])
+

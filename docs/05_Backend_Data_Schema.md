@@ -110,6 +110,7 @@ decisions(
   policy_risk_score NUMERIC(5,4),
   final_risk NUMERIC(5,4),      -- fixed-precision, migrated from float in 0002_numeric_precision — see note below
   decision decision_type,       -- Postgres ENUM: 'allow' | 'block' | 'approve' (lowercase, strictly enforced at the DB level)
+  resolution_status TEXT NULL,  -- 'approved' | 'rejected' (NULL when pending; added in 0003_approval_hardening)
   approver_id UUID REFERENCES users(id) NULL,
   resolved_at TIMESTAMP NULL
 )
@@ -120,7 +121,10 @@ audit_log(
   session_id UUID REFERENCES chat_sessions(id),
   action_id UUID REFERENCES agent_actions(id) NULL,
   decision_id UUID REFERENCES decisions(id) NULL,
-  event TEXT,                  -- e.g. 'decision_made', 'grounding_unavailable', 'policy_engine_error'
+  event TEXT,                  -- human-readable log string (e.g. 'action_approved: actor=...')
+  event_type TEXT,             -- structured event tag ('decision_made', 'action_approved', 'action_rejected')
+  actor_id UUID REFERENCES users(id) NULL,
+  reason TEXT,                 -- explicit approval or rejection rationale
   timestamp TIMESTAMP
 )
 ```
@@ -128,7 +132,9 @@ audit_log(
 ## 2. Key Design Notes
 
 - **`request_id` on `audit_log`** is the correlation key shared with structured application logs — every log line for a single request carries the same ID, satisfying the end-to-end traceability requirement. Confirmed working via direct joins across `audit_log` → `decisions` → `agent_actions`.
-- **`role_scope` on `kb_documents`** is what makes retrieval access-aware — t he retrieval query always filters by the requesting user's role before the vector search runs, not after. Confirmed working: a staff-only document is correctly invisible to customer-role retrieval (grounding_score 0.0 for a customer-role claim about a staff-only sequence-anomaly policy vs. 0.99+ for the same claim under staff role).
+- **`decisions.resolution_status` & Atomic Claims** — tracks explicit resolution state (`approved` / `rejected`). Claims are executed atomically with conditional UPDATE (`WHERE resolved_at IS NULL`) so concurrent approve calls never result in double tool execution.
+- **Structured `audit_log` columns (`event_type`, `actor_id`, `decision_id`, `reason`)** — enable structured SQL analytics without regex parsing, while retaining the human-readable `event` string.
+- **`role_scope` on `kb_documents`** is what makes retrieval access-aware — the retrieval query always filters by the requesting user's role before the vector search runs, not after. Confirmed working: a staff-only document is correctly invisible to customer-role retrieval (grounding_score 0.0 for a customer-role claim about a staff-only sequence-anomaly policy vs. 0.99+ for the same claim under staff role).
 - **`kb_embeddings.embedding VECTOR(1024)`** — confirmed matches BGE-M3's actual output dimension (1024) at implementation time.
 - **`decisions.decision`** is implemented as a strict Postgres ENUM type (`decision_type`), not a free-text column — verified to reject any value other than exactly `allow`, `block`, `approve` (lowercase) at the database level, including rejecting uppercase variants and other candidate values tested during implementation.
 - **`decisions.final_risk` must be `NUMERIC(5,4)`, not `float8`/`double precision`.** A float type was found in practice to return binary floating-point precision artifacts when queried directly (e.g. `0.40000000000000002220446049250313080847263336181640625` instead of `0.4`) — unacceptable for an auditable financial risk score. This is now fixed: Alembic migration `0002_numeric_precision` converted `final_risk`, `policy_risk_score` and `grounding_score` (in `decisions`, `policy_checks` and `grounding_results`) to `NUMERIC(5,4)`, verified via `\d decisions` and direct queries returning clean values such as `0.4000`.
@@ -151,7 +157,7 @@ audit_log(
 ### 5.1 POST `/approvals/{id}/approve`
 Approves a pending held action, executes the underlying banking tool call against the mock ledger, sets resolution timestamps and approver ID, and writes an audit log entry.
 
-- **Access:** Approver role only (`X-User-Role: approver`, approver `user_id`, or `role: "approver"`). Other roles (customer, staff) receive `403 Forbidden`.
+- **Access:** Approver role only, derived exclusively from the user's DB record via `X-User-Id` header. No role override via query param or JSON body is accepted. Other roles (customer, staff) receive `403 Forbidden`.
 - **Precondition:** Approval `{id}` must exist (`404 Not Found` if missing) and must not have been previously resolved (`409 Conflict` if already resolved).
 
 **Request Headers & Parameters:**
@@ -159,16 +165,13 @@ Approves a pending held action, executes the underlying banking tool call agains
 POST /approvals/5f420ccd-3e6c-42ac-b041-67073d5ef404/approve HTTP/1.1
 Host: localhost:8000
 Content-Type: application/json
-X-User-Role: approver
 X-User-Id: 66666666-6666-6666-6666-666666666666
 ```
 
 **Request Body (JSON, all fields optional):**
 ```json
 {
-  "reason": "Manual review passed: customer confirmed transfer intention over phone",
-  "role": "approver",
-  "user_id": "66666666-6666-6666-6666-666666666666"
+  "reason": "Manual review passed: customer confirmed transfer intention over phone"
 }
 ```
 
@@ -177,6 +180,7 @@ X-User-Id: 66666666-6666-6666-6666-666666666666
 {
   "approval_id": "5f420ccd-3e6c-42ac-b041-67073d5ef404",
   "decision": "approve",
+  "resolution_status": "approved",
   "status": "executed",
   "tool_name": "transfer_funds",
   "tool_result": {
@@ -215,7 +219,7 @@ X-User-Id: 66666666-6666-6666-6666-666666666666
 ### 5.2 POST `/approvals/{id}/reject`
 Rejects a pending held action. The tool action is **never executed** against the ledger. The decision is marked resolved, approver ID recorded, and an audit log entry written.
 
-- **Access:** Approver role only. Other roles receive `403 Forbidden`.
+- **Access:** Approver role only, derived exclusively from the user's DB record via `X-User-Id` header. No role override via query param or JSON body is accepted. Other roles receive `403 Forbidden`.
 - **Precondition:** Approval `{id}` must exist (`404 Not Found`) and must not have been previously resolved (`409 Conflict`).
 
 **Request Headers & Parameters:**
@@ -223,16 +227,13 @@ Rejects a pending held action. The tool action is **never executed** against the
 POST /approvals/5f420ccd-3e6c-42ac-b041-67073d5ef404/reject HTTP/1.1
 Host: localhost:8000
 Content-Type: application/json
-X-User-Role: approver
 X-User-Id: 66666666-6666-6666-6666-666666666666
 ```
 
 **Request Body (JSON, all fields optional):**
 ```json
 {
-  "reason": "Suspected account takeover: customer denied authorizing 90% balance drain",
-  "role": "approver",
-  "user_id": "66666666-6666-6666-6666-666666666666"
+  "reason": "Suspected account takeover: customer denied authorizing 90% balance drain"
 }
 ```
 
@@ -241,6 +242,7 @@ X-User-Id: 66666666-6666-6666-6666-666666666666
 {
   "approval_id": "5f420ccd-3e6c-42ac-b041-67073d5ef404",
   "decision": "reject",
+  "resolution_status": "rejected",
   "status": "rejected",
   "tool_name": "transfer_funds",
   "tool_result": null,
@@ -263,7 +265,7 @@ X-User-Id: 66666666-6666-6666-6666-666666666666
 ### 5.3 GET `/approvals/pending`
 Lists all unresolved actions queued for Senior Staff / Approver review, paginated and sorted newest first.
 
-- **Access:** Approver role only (`X-User-Role: approver`, `?role=approver`, or approver `user_id`). Other roles receive `403 Forbidden`.
+- **Access:** Approver role only, derived exclusively from the user's DB record via `X-User-Id` header. No role override via query param or JSON body is accepted. Other roles receive `403 Forbidden`.
 - **Query Parameters:**
   - `limit` (integer, default: 50, min: 1, max: 100): Maximum records to return.
   - `offset` (integer, default: 0, min: 0): Records to skip for pagination.
@@ -272,7 +274,7 @@ Lists all unresolved actions queued for Senior Staff / Approver review, paginate
 ```http
 GET /approvals/pending?limit=10&offset=0 HTTP/1.1
 Host: localhost:8000
-X-User-Role: approver
+X-User-Id: 66666666-6666-6666-6666-666666666666
 ```
 
 **Response (200 OK):**
@@ -292,6 +294,7 @@ X-User-Role: approver
     "policy_risk_score": 0.8,
     "final_risk": 0.4,
     "decision": "approve",
+    "resolution_status": "pending",
     "proposed_at": "2026-10-07T12:04:30.987654Z"
   }
 ]

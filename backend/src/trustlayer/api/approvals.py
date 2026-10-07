@@ -2,15 +2,14 @@
 import uuid
 from datetime import datetime
 from typing import Any
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from trustlayer.agent.loop import execute_tool
 from trustlayer.audit.logger import log_structured_event
 from trustlayer.auth.dependencies import (
     DEFAULT_APPROVER_ID,
-    get_current_user_and_role,
     require_approver,
     resolve_role_for_user,
 )
@@ -37,25 +36,58 @@ class PendingApprovalItem(BaseModel):
     policy_risk_score: float | None = None
     final_risk: float | None = None
     decision: str
+    resolution_status: str | None = "pending"
     proposed_at: str | None = None
 
 
 class ApprovalActionRequest(BaseModel):
     reason: str | None = Field(default=None, description="Reason for the approval or rejection decision")
-    role: str | None = Field(default=None, description="Optional caller role override")
-    user_id: uuid.UUID | None = Field(default=None, description="Optional caller user ID")
+    user_id: uuid.UUID | None = Field(default=None, description="Optional user ID fallback if not supplied via X-User-Id header")
 
 
 class ApprovalActionResponse(BaseModel):
     approval_id: str
     decision: str
+    resolution_status: str
     status: str
     tool_name: str | None = None
     tool_result: dict[str, Any] | None = None
-    approver_id: str | None = None
+    approver_id: str
     resolved_at: str
     reason: str | None = None
     message: str
+
+
+async def _resolve_approver(
+    x_user_id: str | None,
+    payload: ApprovalActionRequest | None,
+    db: AsyncSession,
+) -> uuid.UUID:
+    # Resolve user ID exclusively from X-User-Id header or payload user_id
+    raw_id = x_user_id or (str(payload.user_id) if payload and payload.user_id else None)
+    if not raw_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: X-User-Id header required.",
+        )
+
+    try:
+        uid = uuid.UUID(str(raw_id))
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Invalid user ID format.",
+        )
+
+    # Derive role exclusively from the database record for this user
+    role = await resolve_role_for_user(uid, db)
+    if not role or role.lower() != "approver":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Approver role required.",
+        )
+
+    return uid
 
 
 @router.get("/pending", response_model=list[PendingApprovalItem], status_code=status.HTTP_200_OK)
@@ -81,7 +113,7 @@ async def get_pending_approvals(
     rows = result.all()
 
     pending_items = []
-    # Build list of pending approval items for response payload
+    # Build list of pending approval items including resolution_status
     for dec, action in rows:
         pending_items.append(
             PendingApprovalItem(
@@ -94,66 +126,55 @@ async def get_pending_approvals(
                 policy_risk_score=float(dec.policy_risk_score) if dec.policy_risk_score is not None else None,
                 final_risk=float(dec.final_risk) if dec.final_risk is not None else None,
                 decision=dec.decision.value if hasattr(dec.decision, "value") else str(dec.decision),
+                resolution_status=dec.resolution_status or "pending",
                 proposed_at=action.proposed_at.isoformat() if action and action.proposed_at else None,
             )
         )
     return pending_items
 
 
-async def _resolve_approver_identity(
-    auth_header: dict[str, Any],
-    payload: ApprovalActionRequest | None,
-    db: AsyncSession,
-) -> tuple[str, uuid.UUID]:
-    # Determine effective role and user ID across headers and request body
-    effective_role = auth_header.get("role")
-    effective_user_id = auth_header.get("user_id")
-
-    # Check request body fields if header credentials are not present
-    if payload:
-        if payload.user_id and not effective_user_id:
-            effective_user_id = payload.user_id
-            db_role = await resolve_role_for_user(payload.user_id, db)
-            if db_role:
-                effective_role = db_role
-        if payload.role and not effective_role:
-            effective_role = payload.role.strip().lower()
-
-    # Enforce approver role restriction
-    if not effective_role or effective_role.lower() != "approver":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Forbidden: Approver role required.",
-        )
-
-    approver_uuid = effective_user_id or DEFAULT_APPROVER_ID
-    return effective_role.lower(), approver_uuid
-
-
 @router.post("/{id}/approve", response_model=ApprovalActionResponse, status_code=status.HTTP_200_OK)
 async def approve_held_action(
     id: uuid.UUID,
     payload: ApprovalActionRequest | None = None,
-    auth_header: dict[str, Any] = Depends(get_current_user_and_role),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db_session),
 ) -> ApprovalActionResponse:
-    # Validate approver authorization
-    _, approver_uuid = await _resolve_approver_identity(auth_header, payload, db)
+    # Authenticate caller and derive approver role exclusively from database
+    approver_uuid = await _resolve_approver(x_user_id, payload, db)
 
-    # Fetch decision record by ID
-    stmt = select(Decision).where(Decision.id == id)
-    decision = (await db.execute(stmt)).scalar_one_or_none()
+    # Verify that the decision record exists in the database
+    check_stmt = select(Decision).where(Decision.id == id)
+    decision = (await db.execute(check_stmt)).scalar_one_or_none()
     if not decision:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Approval with ID {id} not found.",
         )
 
-    # Reject resolution if already resolved to avoid double execution
-    if decision.resolved_at is not None:
+    now = datetime.utcnow()
+    reason = payload.reason if payload and payload.reason else "Approved by Senior Staff / Approver"
+
+    # Claim the approval atomically using a conditional UPDATE
+    claim_stmt = (
+        update(Decision)
+        .where(
+            Decision.id == id,
+            Decision.resolved_at.is_(None),
+        )
+        .values(
+            resolved_at=now,
+            approver_id=approver_uuid,
+            resolution_status="approved",
+        )
+    )
+    claim_result = await db.execute(claim_stmt)
+
+    # If row was not updated, another concurrent request claimed it or it is already resolved
+    if claim_result.rowcount != 1:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Approval {id} has already been resolved at {decision.resolved_at.isoformat()}.",
+            detail=f"Approval {id} has already been resolved at {decision.resolved_at.isoformat() if decision.resolved_at else 'earlier'}.",
         )
 
     # Fetch held agent action associated with this decision
@@ -170,7 +191,7 @@ async def approve_held_action(
     chat_sess = (await db.execute(sess_stmt)).scalar_one_or_none()
     customer_user_id = chat_sess.user_id if chat_sess else None
 
-    # Execute held tool action against mock ledger
+    # Execute held tool action against mock ledger strictly after winning atomic claim
     tool_result = await execute_tool(
         intent=action.tool_name or "",
         params=action.params_json or {},
@@ -178,15 +199,7 @@ async def approve_held_action(
         user_id=customer_user_id or approver_uuid,
     )
 
-    # Update decision timestamp and approver identity
-    now = datetime.utcnow()
-    decision.resolved_at = now
-    decision.approver_id = approver_uuid
-
-    # Formulate resolution reason string
-    reason = payload.reason if payload and payload.reason else "Approved by Senior Staff / Approver"
-
-    # Write audit log row into database
+    # Write structured audit log entry into database
     audit_entry = AuditLog(
         id=uuid.uuid4(),
         request_id=action.session_id,
@@ -194,6 +207,9 @@ async def approve_held_action(
         action_id=action.id,
         decision_id=decision.id,
         event=f"action_approved: actor={approver_uuid}, reason={reason}",
+        event_type="action_approved",
+        actor_id=approver_uuid,
+        reason=reason,
         timestamp=now,
     )
     db.add(audit_entry)
@@ -206,6 +222,7 @@ async def approve_held_action(
         data={
             "actor": str(approver_uuid),
             "decision": "approve",
+            "resolution_status": "approved",
             "timestamp": now.isoformat() + "Z",
             "reason": reason,
             "decision_id": str(decision.id),
@@ -215,12 +232,13 @@ async def approve_held_action(
         },
     )
 
-    # Commit state changes and audit records to database
+    # Commit all state changes and audit record to database
     await db.commit()
 
     return ApprovalActionResponse(
         approval_id=str(decision.id),
         decision="approve",
+        resolution_status="approved",
         status="executed",
         tool_name=action.tool_name,
         tool_result=tool_result,
@@ -235,26 +253,44 @@ async def approve_held_action(
 async def reject_held_action(
     id: uuid.UUID,
     payload: ApprovalActionRequest | None = None,
-    auth_header: dict[str, Any] = Depends(get_current_user_and_role),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db_session),
 ) -> ApprovalActionResponse:
-    # Validate approver authorization
-    _, approver_uuid = await _resolve_approver_identity(auth_header, payload, db)
+    # Authenticate caller and derive approver role exclusively from database
+    approver_uuid = await _resolve_approver(x_user_id, payload, db)
 
-    # Fetch decision record by ID
-    stmt = select(Decision).where(Decision.id == id)
-    decision = (await db.execute(stmt)).scalar_one_or_none()
+    # Verify that the decision record exists in the database
+    check_stmt = select(Decision).where(Decision.id == id)
+    decision = (await db.execute(check_stmt)).scalar_one_or_none()
     if not decision:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Approval with ID {id} not found.",
         )
 
-    # Reject resolution if already resolved to avoid double execution
-    if decision.resolved_at is not None:
+    now = datetime.utcnow()
+    reason = payload.reason if payload and payload.reason else "Rejected by Senior Staff / Approver"
+
+    # Claim the rejection atomically using a conditional UPDATE
+    claim_stmt = (
+        update(Decision)
+        .where(
+            Decision.id == id,
+            Decision.resolved_at.is_(None),
+        )
+        .values(
+            resolved_at=now,
+            approver_id=approver_uuid,
+            resolution_status="rejected",
+        )
+    )
+    claim_result = await db.execute(claim_stmt)
+
+    # If row was not updated, another concurrent request claimed it or it is already resolved
+    if claim_result.rowcount != 1:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Approval {id} has already been resolved at {decision.resolved_at.isoformat()}.",
+            detail=f"Approval {id} has already been resolved at {decision.resolved_at.isoformat() if decision.resolved_at else 'earlier'}.",
         )
 
     # Fetch held agent action associated with this decision
@@ -263,15 +299,7 @@ async def reject_held_action(
 
     # Tool action is explicitly never executed on rejection
 
-    # Update decision timestamp and approver identity
-    now = datetime.utcnow()
-    decision.resolved_at = now
-    decision.approver_id = approver_uuid
-
-    # Formulate resolution reason string
-    reason = payload.reason if payload and payload.reason else "Rejected by Senior Staff / Approver"
-
-    # Write audit log row into database
+    # Write structured audit log entry into database
     audit_entry = AuditLog(
         id=uuid.uuid4(),
         request_id=action.session_id if action else None,
@@ -279,6 +307,9 @@ async def reject_held_action(
         action_id=action.id if action else None,
         decision_id=decision.id,
         event=f"action_rejected: actor={approver_uuid}, reason={reason}",
+        event_type="action_rejected",
+        actor_id=approver_uuid,
+        reason=reason,
         timestamp=now,
     )
     db.add(audit_entry)
@@ -291,6 +322,7 @@ async def reject_held_action(
         data={
             "actor": str(approver_uuid),
             "decision": "reject",
+            "resolution_status": "rejected",
             "timestamp": now.isoformat() + "Z",
             "reason": reason,
             "decision_id": str(decision.id),
@@ -299,12 +331,13 @@ async def reject_held_action(
         },
     )
 
-    # Commit state changes and audit records to database
+    # Commit all state changes and audit record to database
     await db.commit()
 
     return ApprovalActionResponse(
         approval_id=str(decision.id),
         decision="reject",
+        resolution_status="rejected",
         status="rejected",
         tool_name=action.tool_name if action else None,
         tool_result=None,
