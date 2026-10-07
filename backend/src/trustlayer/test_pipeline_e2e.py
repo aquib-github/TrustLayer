@@ -187,7 +187,12 @@ async def test_all_outcomes():
         print("\n" + "-" * 80)
         print("[TEST 6] Testing GET /approvals/pending endpoint")
         print("-" * 80)
-        res_pending = await client.get("/approvals/pending")
+        # Verify non-approver role receives 403 Forbidden
+        res_forbidden = await client.get("/approvals/pending", headers={"X-User-Role": "customer"})
+        assert res_forbidden.status_code == 403
+
+        # Verify approver role receives 200 OK
+        res_pending = await client.get("/approvals/pending", headers={"X-User-Role": "approver"})
         print(f"Status Code: {res_pending.status_code}")
         pending_list = res_pending.json()
         print(f"Pending Approvals Count: {len(pending_list)}")

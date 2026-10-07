@@ -46,16 +46,7 @@ class ChatResponse(BaseModel):
     response: str
 
 
-class PendingApprovalItem(BaseModel):
-    decision_id: str
-    action_id: str | None = None
-    session_id: str | None = None
-    tool_name: str | None = None
-    params: dict[str, Any] | None = None
-    grounding_score: float | None = None
-    policy_risk_score: float | None = None
-    final_risk: float | None = None
-    decision: str
+from trustlayer.api.approvals import PendingApprovalItem
 
 
 @router.post("/chat", response_model=ChatResponse, status_code=status.HTTP_200_OK)
@@ -98,46 +89,3 @@ async def chat(
             detail=f"Agent loop error: {str(exc)}",
         ) from exc
 
-
-@router.get("/approvals/pending", response_model=list[PendingApprovalItem], status_code=status.HTTP_200_OK)
-async def get_pending_approvals(
-    db: AsyncSession = Depends(get_db_session),
-) -> list[PendingApprovalItem]:
-    """
-    GET /approvals/pending endpoint.
-    Returns all unresolved actions queued for Senior Staff / Approver review.
-    """
-    try:
-        stmt = (
-            select(Decision, AgentAction)
-            .outerjoin(AgentAction, Decision.action_id == AgentAction.id)
-            .where(
-                Decision.decision == DecisionType.APPROVE,
-                Decision.resolved_at.is_(None),
-            )
-            .order_by(Decision.id.desc())
-        )
-        result = await db.execute(stmt)
-        rows = result.all()
-
-        pending_items = []
-        for dec, action in rows:
-            pending_items.append(
-                PendingApprovalItem(
-                    decision_id=str(dec.id),
-                    action_id=str(dec.action_id) if dec.action_id else None,
-                    session_id=str(action.session_id) if action else None,
-                    tool_name=action.tool_name if action else None,
-                    params=action.params_json if action else None,
-                    grounding_score=float(dec.grounding_score) if dec.grounding_score is not None else None,
-                    policy_risk_score=float(dec.policy_risk_score) if dec.policy_risk_score is not None else None,
-                    final_risk=float(dec.final_risk) if dec.final_risk is not None else None,
-                    decision=dec.decision.value if hasattr(dec.decision, "value") else str(dec.decision),
-                )
-            )
-        return pending_items
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch pending approvals: {str(exc)}",
-        ) from exc
