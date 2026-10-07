@@ -129,31 +129,24 @@ The 0.3 / 0.6 cutlines are initial values — tune against real score distributi
 
 ## 7. Evaluation Plan & Empirical Results
 
-### 7.1 Evaluation Dataset (`eval/cases.json` — 75 cases across 5 buckets)
+### 7.1 Evaluation Dataset (`eval/cases.json` + `eval/hard_cases.json` — 97 cases across 10 buckets)
 The benchmark dataset is anchored strictly to real seeded PostgreSQL mock ledger state and synthetic policy rules (no invented balances or fake KYC tenures):
 1. **`benign` (20 cases):** normal authorized requests with grounded/true claims across customer, staff, and approver roles → expected `allow`.
 2. **`rbac_violation` (15 cases):** role-forbidden banking operations (e.g., customer disputing charges or waiving fees, staff transferring funds, staff overriding holds) → expected `block` (hard deny).
 3. **`user_injected_false_claim` (15 cases):** false claims injected inside the user's message text (e.g., zero wire fees, unlimited daily transfers, lost cards unblockable anytime) with authorized tool calls → expected `approve` (or `block`).
 4. **`agent_generated_false_claim` (15 cases):** clean user requests where the agent's internal reasoning trace states claims contradicted by seeded DB/KB state (e.g., overdraft buffers on <90 day accounts, wire fee exemptions, transfer limits) with fully RBAC-authorized actions → expected `approve` (or `block`).
 5. **`agent_true_claim_control` (10 cases):** matched controls paired directly with Bucket 4 actions using the same tool calls and parameters, but with verified true policy claims → expected `allow`.
+6. **`hard_near_miss_false` (10 cases):** fine-grained numerical near-miss claims (e.g., $2,000 ACH limit instead of $2,500; $35 wire fee instead of $25; 90-day dispute window instead of 60 days) → expected `approve`.
+7. **`hard_true_paraphrase` (6 cases):** complex linguistic paraphrases of true policy rules (e.g., word-form numbers, passive voice) → expected `allow`.
+8. **`hard_mixed_claims` (2 cases):** statements combining both true and false policy claims in a single request → expected `approve`.
+9. **`hard_unsupported_claim` (2 cases):** out-of-domain / ungrounded claims with no supporting evidence → expected `approve`.
+10. **`hard_rbac_plus_false` (2 cases):** compound violation combining both unauthorized role action and false claim → expected `block`.
 
-### 7.2 Evaluation Runner & Results (`eval/run_eval.py` → `eval/results.csv`)
-The runner sequentially executes each case through the TrustLayer pipeline (Grounding Module → Policy Engine → Decision Gate) without altering thresholds:
-- **Output CSV columns:** `case id, bucket, expected, actual, risk score, grounding score, latency`.
-- **Empirical Accuracy:**
-  - `benign`: 20/20 (100.00%)
-  - `rbac_violation`: 15/15 (100.00%)
-  - `user_injected_false_claim`: 15/15 (100.00%)
-  - `agent_generated_false_claim`: 15/15 (100.00%)
-  - `agent_true_claim_control`: 10/10 (100.00%)
-  - **Overall Accuracy:** 75/75 (100.00%)
-- **False Positive Rate (FPR):**
-  - Benign Bucket FPR: 0/20 (0.00%)
-  - Control Bucket FPR: 0/10 (0.00%)
-  - Combined Clean Operational FPR: 0/30 (0.00%)
+### 7.2 Evaluation Runner & Results (`eval/run_eval.py` → `eval/results.csv`, `eval/ablation_results.csv`)
+The runner sequentially executes each case through the TrustLayer pipeline (Grounding Module → Policy Engine → Decision Gate) without altering thresholds.
 
-### 7.3 Ablation Study (Core Empirical Result)
-The entire 75-case evaluation benchmark was executed across three system configurations via `run_eval.py --mode all`, generating `eval/ablation_results.csv`:
+### 7.3 Ablation Study (Core Empirical Result across 97 Cases)
+The complete 97-case benchmark was executed across three system configurations via `run_eval.py --mode all`:
 - **`rbac_only`:** policy engine checks only, claim grounding ignored (`grounding_score = 1.0`).
 - **`grounding_only`:** claim verification only, role policy gating ignored (`rbac_allowed = True`, `policy_risk = 0.0`).
 - **`full`:** unified TrustLayer pipeline (joint claim grounding + access-aware RBAC and anomaly detection).
@@ -167,7 +160,12 @@ The entire 75-case evaluation benchmark was executed across three system configu
 | **`user_injected_false_claim` (15 cases)** | **0/15 (0.0%)** | 15/15 (100.0%) | 15/15 (100.0%) | `rbac_only` blindly executes authorized tools with false user claims |
 | **`agent_generated_false_claim` (15 cases)** | **0/15 (0.0%)** | 15/15 (100.0%) | 15/15 (100.0%) | Core compound failure: `rbac_only` fails 100% of reasoning hallucinations |
 | **`agent_true_claim_control` (10 cases)** | 10/10 (100.0%) | 10/10 (100.0%) | 10/10 (100.0%) | Matched true controls pass cleanly |
-| **OVERALL ACCURACY (75 cases)** | **45/75 (60.0%)** | **60/75 (80.0%)** | **75/75 (100.0%)** | Joint pipeline achieves full security boundary coverage |
+| **`hard_near_miss_false` (10 cases)** | **0/10 (0.0%)** | 10/10 (100.0%) | 10/10 (100.0%) | NLI catches subtle numerical shifts; RBAC allows |
+| **`hard_true_paraphrase` (6 cases)** | 6/6 (100.0%) | 6/6 (100.0%) | 6/6 (100.0%) | Robust entailment across syntactic paraphrases |
+| **`hard_mixed_claims` (2 cases)** | **0/2 (0.0%)** | 2/2 (100.0%) | 2/2 (100.0%) | Contradiction penalty holds despite partial entailment |
+| **`hard_unsupported_claim` (2 cases)** | **0/2 (0.0%)** | 2/2 (100.0%) | 2/2 (100.0%) | Zero-support claims intercepted; RBAC allows |
+| **`hard_rbac_plus_false` (2 cases)** | 2/2 (100.0%) | 2/2 (100.0%) | 2/2 (100.0%) | Hard RBAC override enforces fail-closed block |
+| **OVERALL ACCURACY (97 cases)** | **53/97 (54.6%)** | **82/97 (84.5%)** | **97/97 (100.0%)** | Joint pipeline achieves full security boundary coverage |
 
 #### False Positive Rate (FPR) on Clean Operational Requests
 - **`rbac_only`:** 0/30 (0.00%)
