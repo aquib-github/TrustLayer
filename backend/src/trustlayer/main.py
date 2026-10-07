@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from trustlayer.api.analytics import router as analytics_router
 from trustlayer.api.approvals import router as approvals_router
 from trustlayer.api.chat import router as chat_router
 
@@ -12,6 +13,7 @@ app = FastAPI(
 # Register API routers
 app.include_router(chat_router)
 app.include_router(approvals_router)
+app.include_router(analytics_router)
 
 
 

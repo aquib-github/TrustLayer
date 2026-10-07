@@ -53,3 +53,36 @@ async def require_approver(
         "user_id": user_uuid,
         "role": db_role.lower(),
     }
+
+
+async def require_staff_or_approver(
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    # Require X-User-Id header as user identity
+    if not x_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: X-User-Id header required.",
+        )
+
+    try:
+        user_uuid = uuid.UUID(str(x_user_id))
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Invalid user ID format.",
+        )
+
+    # Derive role exclusively from the user's database record
+    db_role = await resolve_role_for_user(user_uuid, db)
+    if not db_role or db_role.lower() not in ("staff", "approver"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Staff or Approver role required.",
+        )
+
+    return {
+        "user_id": user_uuid,
+        "role": db_role.lower(),
+    }

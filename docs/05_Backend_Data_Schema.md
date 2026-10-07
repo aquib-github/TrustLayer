@@ -300,3 +300,114 @@ X-User-Id: 66666666-6666-6666-6666-666666666666
 ]
 ```
 
+---
+
+### 5.4 GET `/dashboard/summary`
+Returns aggregated decision statistics: counts by decision type, user role, and tool; average risk and grounding scores per decision. Uses SQL aggregation (not Python loops).
+
+- **Access:** Staff or Approver role only, derived exclusively from the user's DB record via `X-User-Id` header. Customers receive `403 Forbidden`.
+- **Query Parameters:**
+  - `from` (string, optional): ISO date start filter (inclusive).
+  - `to` (string, optional): ISO date end filter (inclusive).
+
+**Request:**
+```http
+GET /dashboard/summary?from=2026-10-01&to=2026-10-07 HTTP/1.1
+Host: localhost:8000
+X-User-Id: 44444444-4444-4444-4444-444444444444
+```
+
+**Response (200 OK):**
+```json
+{
+  "total_decisions": 42,
+  "by_decision": {
+    "allow": 25,
+    "approve": 10,
+    "block": 7
+  },
+  "by_role": {
+    "customer": 30,
+    "staff": 8,
+    "approver": 4
+  },
+  "by_tool": [
+    { "tool_name": "transfer_funds", "count": 20 },
+    { "tool_name": "check_balance", "count": 15 },
+    { "tool_name": "dispute_charge", "count": 7 }
+  ],
+  "avg_scores_per_decision": [
+    { "decision": "allow", "avg_risk": 0.0, "avg_grounding": 0.95 },
+    { "decision": "approve", "avg_risk": 0.45, "avg_grounding": 0.3 },
+    { "decision": "block", "avg_risk": 1.0, "avg_grounding": 0.1 }
+  ],
+  "date_from": "2026-10-01",
+  "date_to": "2026-10-07"
+}
+```
+
+**Forbidden Response (403 Forbidden — Customer role):**
+```json
+{
+  "detail": "Forbidden: Staff or Approver role required."
+}
+```
+
+---
+
+### 5.5 GET `/audit`
+Returns paginated, filterable audit log rows with structured columns, joined decision scores, tool name, and originating user role. Sorted newest first.
+
+- **Access:** Staff or Approver role only, derived exclusively from the user's DB record via `X-User-Id` header. Customers receive `403 Forbidden`.
+- **Query Parameters:**
+  - `limit` (integer, default: 50, min: 1, max: 100): Maximum records to return.
+  - `offset` (integer, default: 0, min: 0): Records to skip for pagination.
+  - `decision` (string, optional): Filter by decision type (`allow`, `approve`, `block`).
+  - `role` (string, optional): Filter by originating user role (`customer`, `staff`, `approver`).
+  - `tool` (string, optional): Filter by tool name.
+  - `actor_id` (UUID string, optional): Filter by actor UUID (approver who resolved).
+  - `from` (string, optional): ISO date start filter.
+  - `to` (string, optional): ISO date end filter.
+
+**Request:**
+```http
+GET /audit?limit=10&offset=0&decision=approve&tool=transfer_funds HTTP/1.1
+Host: localhost:8000
+X-User-Id: 66666666-6666-6666-6666-666666666666
+```
+
+**Response (200 OK):**
+```json
+{
+  "total": 15,
+  "limit": 10,
+  "offset": 0,
+  "items": [
+    {
+      "audit_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "request_id": "f0e1d2c3-b4a5-6789-0abc-def123456789",
+      "session_id": "8b32d201-1402-4fc8-9f1e-f3b145ac7462",
+      "action_id": "5ae4145b-ff2f-4b79-98a1-22ac18be6a18",
+      "decision_id": "5f420ccd-3e6c-42ac-b041-67073d5ef404",
+      "event": "decision_made",
+      "event_type": "decision_made",
+      "actor_id": null,
+      "reason": null,
+      "timestamp": "2026-10-07T12:04:30.987654Z",
+      "decision": "approve",
+      "tool_name": "transfer_funds",
+      "grounding_score": 0.2,
+      "policy_risk_score": 0.8,
+      "final_risk": 0.5,
+      "user_role": "customer"
+    }
+  ]
+}
+```
+
+**Forbidden Response (403 Forbidden — Customer role):**
+```json
+{
+  "detail": "Forbidden: Staff or Approver role required."
+}
+```
